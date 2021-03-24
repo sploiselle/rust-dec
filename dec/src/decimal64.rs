@@ -26,6 +26,7 @@ use std::ops::{
 use std::str::FromStr;
 
 use libc::c_char;
+use serde::{Deserialize, Serialize};
 
 use crate::context::{Class, Context};
 #[cfg(feature = "arbitrary-precision")]
@@ -53,7 +54,7 @@ use crate::error::ParseDecimalError;
 /// context, which has some performance overhead. For maximum performance when
 /// performing operations in bulk, use a long-lived context that you construct
 /// yourself.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Deserialize, Serialize)]
 pub struct Decimal64 {
     pub(crate) inner: decnumber_sys::decDouble,
 }

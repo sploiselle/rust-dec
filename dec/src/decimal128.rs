@@ -26,6 +26,7 @@ use std::ops::{
 use std::str::FromStr;
 
 use libc::c_char;
+use serde::{Deserialize, Serialize};
 
 use crate::context::{Class, Context};
 #[cfg(feature = "arbitrary-precision")]
@@ -53,7 +54,7 @@ use crate::error::ParseDecimalError;
 /// context, which has some performance overhead. For maximum performance when
 /// performing operations in bulk, use a long-lived context that you construct
 /// yourself.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Deserialize, Serialize)]
 pub struct Decimal128 {
     pub(crate) inner: decnumber_sys::decQuad,
 }
@@ -442,6 +443,34 @@ impl From<u64> for Decimal128 {
     }
 }
 
+#[cfg(target_pointer_width = "32")]
+impl From<usize> for Decimal128 {
+    fn from(n: usize) -> Decimal128 {
+        Decimal128::from(n as u32)
+    }
+}
+
+#[cfg(target_pointer_width = "32")]
+impl From<isize> for Decimal128 {
+    fn from(n: isize) -> Decimal128 {
+        Decimal128::from(n as i32)
+    }
+}
+
+#[cfg(target_pointer_width = "64")]
+impl From<usize> for Decimal128 {
+    fn from(n: usize) -> Decimal128 {
+        Decimal128::from(n as u64)
+    }
+}
+
+#[cfg(target_pointer_width = "64")]
+impl From<isize> for Decimal128 {
+    fn from(n: isize) -> Decimal128 {
+        Decimal128::from(n as i64)
+    }
+}
+
 impl From<Decimal32> for Decimal128 {
     fn from(d32: Decimal32) -> Decimal128 {
         Decimal128::from(Decimal64::from(d32))
@@ -665,9 +694,6 @@ impl Context<Decimal128> {
     /// // Exact result
     /// assert!(!ctx.status().inexact());
     /// ```
-    ///
-    /// To avoid inexact results when converting from large `i64`, use
-    /// [`crate::Decimal128`] instead.
     pub fn from_i128(&mut self, n: i128) -> Decimal128 {
         from_signed_int!(Decimal128, self, n)
     }

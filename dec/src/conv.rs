@@ -53,6 +53,42 @@ macro_rules! __from_int {
     }};
 }
 
+macro_rules! decnum_from_signed_int {
+    ($t:ty, $cx:expr, $n:expr) => {
+        __decnum_from_int!($t, i32, $cx, $n)
+    };
+}
+
+/// Like `from_signed_int!` but for unsigned integers.
+macro_rules! decnum_from_unsigned_int {
+    ($t:ty, $cx:expr, $n:expr) => {
+        __decnum_from_int!($t, u32, $cx, $n)
+    };
+}
+
+macro_rules! __decnum_from_int {
+    ($t:ty, $l:ty, $cx:expr, $n:expr) => {{
+        let n = $n.to_be_bytes();
+        assert!(
+            n.len() % 4 == 0 && n.len() >= 4,
+            "from_int requires size of integer to be a multiple of 32"
+        );
+        let two_pow_32 = $cx.parse("4294967296").unwrap();
+
+        // Process `$n` in 32-bit chunks. Only the first chunk has to be sign
+        // aware. Each turn of the loop computes `d = d * 2^32 + n`, where `n`
+        // is the next 32-bit chunk.
+        let mut d = <$t>::from(<$l>::from_be_bytes(n[..4].try_into().unwrap()));
+        for i in (4..n.len()).step_by(4) {
+            $cx.mul(&mut d, &two_pow_32);
+            let n = <$t>::from(u32::from_be_bytes(n[i..i + 4].try_into().unwrap()));
+            $cx.add(&mut d, &n);
+        }
+
+        d
+    }};
+}
+
 /// Converts from some decimal into a string in standard notation.
 macro_rules! to_standard_notation_string {
     ($d:expr) => {{

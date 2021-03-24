@@ -14,16 +14,20 @@
 // limitations under the License.
 
 use std::cmp::Ordering;
-use std::convert::TryFrom;
+use std::convert::{TryFrom, TryInto};
 use std::ffi::{CStr, CString};
 use std::fmt;
+use std::iter::{Product, Sum};
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
+use std::ops::{Add, AddAssign, Mul, MulAssign, Neg};
 use std::str::FromStr;
 
 use libc::c_char;
+use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
+use serde::ser::{Serialize, SerializeStruct, Serializer};
 
-use crate::context::{Class, Context};
+use crate::context::{Class, Context, Status};
 use crate::decimal128::Decimal128;
 use crate::decimal32::Decimal32;
 use crate::decimal64::Decimal64;
@@ -50,7 +54,7 @@ fn validate_n(n: usize) {
 /// at compile time, so they are checked at runtime.
 #[cfg_attr(docsrs, doc(cfg(feature = "arbitrary-precision")))]
 #[repr(C)]
-#[derive(Clone)]
+#[derive(Clone, Copy, Hash)]
 pub struct Decimal<const N: usize> {
     digits: u32,
     exponent: i32,
@@ -67,10 +71,24 @@ impl<const N: usize> Decimal<N> {
         self as *mut Decimal<N> as *mut decnumber_sys::decNumber
     }
 
-    /// Constructs a decimal number with `N / 3` digits of precision
+    /// Constructs a decimal number with `N * 3` digits of precision
     /// representing the number 0.
     pub fn zero() -> Decimal<N> {
         Decimal::default()
+    }
+
+    /// Constructs a decimal number representing a non-signaling NaN.
+    pub fn nan() -> Decimal<N> {
+        let mut d = Decimal::default();
+        d.bits = decnumber_sys::DECNAN;
+        d
+    }
+
+    /// Constructs a decimal number representing an infinite value.
+    pub fn infinity() -> Decimal<N> {
+        let mut d = Decimal::default();
+        d.bits = decnumber_sys::DECINF;
+        d
     }
 
     /// Computes the number of significant digits in the number.
@@ -81,9 +99,38 @@ impl<const N: usize> Decimal<N> {
         self.digits
     }
 
+    /// Returns the individual digits of the coefficient in 8-bit, unpacked
+    /// [binary-coded decimal][bcd] format.
+    ///
+    /// [bcd]: https://en.wikipedia.org/wiki/Binary-coded_decimal
+    pub fn coefficient_digits(&self) -> Vec<u8> {
+        let digits = self.digits() as usize;
+        let mut buf = Vec::<u8>::with_capacity(digits);
+        buf.resize(digits, 0);
+        unsafe {
+            decnumber_sys::decNumberGetBCD(self.as_ptr(), buf.as_mut_ptr() as *mut u8);
+        };
+        buf
+    }
+
     /// Computes the exponent of the number.
     pub fn exponent(&self) -> i32 {
         self.exponent
+    }
+
+    /// Computes the number of digits necessary in standard notation to
+    /// represent `self`, not including any leading zeroes.
+    pub fn precision(&self) -> usize {
+        if self.exponent >= 0 {
+            // More zeroes than digits, so dominates precision
+            self.digits as usize + self.exponent.abs() as usize
+        } else if self.exponent.abs() as usize > self.digits() as usize {
+            // Zeroes lpad
+            self.exponent.abs() as usize
+        } else {
+            // decimal point splices
+            self.digits as usize
+        }
     }
 
     /// Reports whether the number is finite.
@@ -110,6 +157,10 @@ impl<const N: usize> Decimal<N> {
     /// [`Decimal128::is_negative`].
     pub fn is_negative(&self) -> bool {
         (self.bits & decnumber_sys::DECNEG) != 0
+    }
+
+    fn set_negative(&mut self) {
+        self.bits |= decnumber_sys::DECNEG;
     }
 
     /// Reports whether the number is a quiet NaN.
@@ -188,6 +239,41 @@ impl<const N: usize> Decimal<N> {
     pub fn to_raw_parts(&self) -> (u32, i32, u8, [u16; N]) {
         (self.digits, self.exponent, self.bits, self.lsu)
     }
+
+    /// Returns `self` cast as a `Decimal::<M>`.
+    pub fn to_width<const M: usize>(&self) -> Decimal<M> {
+        println!("converting to width");
+        // if `self` exceeds the maximum digits representable by `M`, return infinity.
+        println!(
+            "to width self.digits() {}, (M * 3).try_into().unwrap() {}",
+            self.digits(),
+            M * 3
+        );
+        if self.precision() > (M * 3).try_into().unwrap() {
+            let mut r = Decimal::<M>::infinity();
+            if self.is_negative() {
+                r.set_negative();
+            }
+            return r;
+        }
+
+        let mut m = Decimal::<M>::default();
+
+        let lsu_min = std::cmp::min(self.lsu.len(), m.lsu.len());
+
+        m.lsu[..lsu_min].copy_from_slice(&self.lsu[..lsu_min]);
+        m.bits = self.bits;
+        m.digits = self.digits;
+        m.exponent = self.exponent;
+
+        m
+    }
+
+    /// Returns a string of the number in standard notation, i.e. guaranteed to
+    /// not be scientific notation.
+    pub fn to_standard_notation_string(&self) -> String {
+        to_standard_notation_string!(self)
+    }
 }
 
 impl<const N: usize> Default for Decimal<N> {
@@ -236,6 +322,92 @@ impl<const N: usize> FromStr for Decimal<N> {
     }
 }
 
+impl<const N: usize> From<i32> for Decimal<N> {
+    fn from(n: i32) -> Decimal<N> {
+        validate_n(N);
+        let mut d = MaybeUninit::<Decimal<N>>::uninit();
+        unsafe {
+            decnumber_sys::decNumberFromInt32(d.as_mut_ptr() as *mut decnumber_sys::decNumber, n);
+            d.assume_init()
+        }
+    }
+}
+
+impl<const N: usize> From<u32> for Decimal<N> {
+    fn from(n: u32) -> Decimal<N> {
+        validate_n(N);
+        let mut d = MaybeUninit::<Decimal<N>>::uninit();
+        unsafe {
+            decnumber_sys::decNumberFromUInt32(d.as_mut_ptr() as *mut decnumber_sys::decNumber, n);
+            d.assume_init()
+        }
+    }
+}
+
+impl<const N: usize> From<i64> for Decimal<N> {
+    fn from(n: i64) -> Decimal<N> {
+        let mut cx = Context::<Decimal<N>>::default();
+        let d = decnum_from_signed_int!(Decimal<N>, cx, n);
+        debug_assert!(!cx.status().any());
+        d
+    }
+}
+
+impl<const N: usize> From<u64> for Decimal<N> {
+    fn from(n: u64) -> Decimal<N> {
+        let mut cx = Context::<Decimal<N>>::default();
+        let d = decnum_from_unsigned_int!(Decimal<N>, cx, n);
+        debug_assert!(!cx.status().any());
+        d
+    }
+}
+
+impl<const N: usize> From<i128> for Decimal<N> {
+    fn from(n: i128) -> Decimal<N> {
+        let mut cx = Context::<Decimal<N>>::default();
+        let d = decnum_from_signed_int!(Decimal<N>, cx, n);
+        debug_assert!(!cx.status().any());
+        d
+    }
+}
+
+impl<const N: usize> From<u128> for Decimal<N> {
+    fn from(n: u128) -> Decimal<N> {
+        let mut cx = Context::<Decimal<N>>::default();
+        let d = decnum_from_unsigned_int!(Decimal<N>, cx, n);
+        debug_assert!(!cx.status().any());
+        d
+    }
+}
+
+#[cfg(target_pointer_width = "32")]
+impl<const N: usize> From<usize> for Decimal<N> {
+    fn from(n: usize) -> Decimal<N> {
+        Decimal::<N>::from(n as u32)
+    }
+}
+
+#[cfg(target_pointer_width = "32")]
+impl<const N: usize> From<isize> for Decimal<N> {
+    fn from(n: isize) -> Decimal<N> {
+        Decimal::<N>::from(n as i32)
+    }
+}
+
+#[cfg(target_pointer_width = "64")]
+impl<const N: usize> From<usize> for Decimal<N> {
+    fn from(n: usize) -> Decimal<N> {
+        Decimal::<N>::from(n as u64)
+    }
+}
+
+#[cfg(target_pointer_width = "64")]
+impl<const N: usize> From<isize> for Decimal<N> {
+    fn from(n: isize) -> Decimal<N> {
+        Decimal::<N>::from(n as i64)
+    }
+}
+
 impl<const N: usize> From<Decimal32> for Decimal<N> {
     fn from(n: Decimal32) -> Decimal<N> {
         validate_n(N);
@@ -278,6 +450,118 @@ impl<const N: usize> From<Decimal128> for Decimal<N> {
     }
 }
 
+impl<const N: usize> PartialOrd for Decimal<N> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Context::<Decimal<N>>::default().partial_cmp(self, other)
+    }
+}
+
+impl<const N: usize> PartialEq for Decimal<N> {
+    fn eq(&self, other: &Self) -> bool {
+        self.partial_cmp(other) == Some(Ordering::Equal)
+    }
+}
+
+impl<const N: usize> Neg for Decimal<N> {
+    type Output = Decimal<N>;
+
+    fn neg(self) -> Decimal<N> {
+        let mut d = self.clone();
+        Context::<Decimal<N>>::default().minus(&mut d);
+        d
+    }
+}
+
+impl<const N: usize> Add<Decimal<N>> for Decimal<N> {
+    type Output = Decimal<N>;
+
+    fn add(self, rhs: Decimal<N>) -> Decimal<N> {
+        let mut d = self.clone();
+        Context::<Decimal<N>>::default().add(&mut d, &rhs);
+        d
+    }
+}
+
+impl<const N: usize> AddAssign<Decimal<N>> for Decimal<N> {
+    fn add_assign(&mut self, rhs: Decimal<N>) {
+        Context::<Decimal<N>>::default().add(self, &rhs);
+    }
+}
+
+impl<const N: usize> Mul<Decimal<N>> for Decimal<N> {
+    type Output = Decimal<N>;
+
+    fn mul(self, rhs: Decimal<N>) -> Decimal<N> {
+        let mut d = self.clone();
+        Context::<Decimal<N>>::default().mul(&mut d, &rhs);
+        d
+    }
+}
+
+impl<const N: usize> MulAssign<Decimal<N>> for Decimal<N> {
+    fn mul_assign(&mut self, rhs: Decimal<N>) {
+        Context::<Decimal<N>>::default().mul(self, &rhs);
+    }
+}
+
+/// This implementation of `Sum` creates a new `Context::<Decimal<N>>` on each
+/// invocation, without providing a mechanism to add setting to the `Context` or
+/// return its status. Instead, we recommend using `Context::<Decimal<N>>::sum`.
+impl<const N: usize> Sum for Decimal<N> {
+    fn sum<I>(iter: I) -> Self
+    where
+        I: Iterator<Item = Decimal<N>>,
+    {
+        let mut cx = Context::<Decimal<N>>::default();
+        let mut sum = Decimal::<N>::zero();
+        for d in iter {
+            cx.add(&mut sum, &d);
+        }
+        sum
+    }
+}
+
+/// This implementation of `Sum` creates a new `Context::<Decimal<N>>` on each
+/// invocation, without providing a mechanism to add setting to the `Context` or
+/// return its status. Instead, we recommend using `Context::<Decimal<N>>::sum`.
+impl<'a, const N: usize> Sum<&'a Decimal<N>> for Decimal<N> {
+    fn sum<I>(iter: I) -> Self
+    where
+        I: Iterator<Item = &'a Decimal<N>>,
+    {
+        iter.copied().sum()
+    }
+}
+
+/// This implementation of `Sum` creates a new `Context::<Decimal<N>>` on each
+/// invocation, without providing a mechanism to add setting to the `Context` or
+/// return its status. Instead, we recommend using `Context::<Decimal<N>>::sum`.
+impl<const N: usize> Product for Decimal<N> {
+    fn product<I>(iter: I) -> Self
+    where
+        I: Iterator<Item = Decimal<N>>,
+    {
+        let mut cx = Context::<Decimal<N>>::default();
+        let mut product = Decimal::<N>::from(1);
+        for d in iter {
+            cx.mul(&mut product, &d);
+        }
+        product
+    }
+}
+
+/// This implementation of `Sum` creates a new `Context::<Decimal<N>>` on each
+/// invocation, without providing a mechanism to add setting to the `Context` or
+/// return its status. Instead, we recommend using `Context::<Decimal<N>>::sum`.
+impl<'a, const N: usize> Product<&'a Decimal<N>> for Decimal<N> {
+    fn product<I>(iter: I) -> Self
+    where
+        I: Iterator<Item = &'a Decimal<N>>,
+    {
+        iter.copied().product()
+    }
+}
+
 impl<const N: usize> Default for Context<Decimal<N>> {
     fn default() -> Context<Decimal<N>> {
         let mut ctx = MaybeUninit::<decnumber_sys::decContext>::uninit();
@@ -294,6 +578,172 @@ impl<const N: usize> Default for Context<Decimal<N>> {
             inner: ctx,
             _phantom: PhantomData,
         }
+    }
+}
+
+impl<const N: usize> Serialize for Decimal<N> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut s = serializer.serialize_struct("Decimal", 4)?;
+        s.serialize_field("digits", &self.digits)?;
+        s.serialize_field("exponent", &self.exponent)?;
+        s.serialize_field("bits", &self.bits)?;
+        s.serialize_field("lsu", self.lsu.as_ref())?;
+        s.end()
+    }
+}
+
+impl<'de, const N: usize> Deserialize<'de> for Decimal<N> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        enum Field {
+            Digits,
+            Exponent,
+            Bits,
+            Lsu,
+        }
+
+        impl<'de> Deserialize<'de> for Field {
+            fn deserialize<D>(deserializer: D) -> Result<Field, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                struct FieldVisitor;
+
+                impl<'de> Visitor<'de> for FieldVisitor {
+                    type Value = Field;
+
+                    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                        formatter.write_str("`digits`, `exponent`, `bits`, or `lsu`")
+                    }
+
+                    fn visit_str<E>(self, value: &str) -> Result<Field, E>
+                    where
+                        E: de::Error,
+                    {
+                        match value {
+                            "digits" => Ok(Field::Digits),
+                            "exponent" => Ok(Field::Exponent),
+                            "bits" => Ok(Field::Bits),
+                            "lsu" => Ok(Field::Lsu),
+                            _ => Err(de::Error::unknown_field(value, FIELDS)),
+                        }
+                    }
+                }
+
+                deserializer.deserialize_identifier(FieldVisitor)
+            }
+        }
+
+        struct DecimalVisitor<const N: usize>;
+
+        impl<'de, const N: usize> Visitor<'de> for DecimalVisitor<N> {
+            type Value = Decimal<N>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("struct Decimal")
+            }
+
+            fn visit_seq<V>(self, mut seq: V) -> Result<Decimal<N>, V::Error>
+            where
+                V: SeqAccess<'de>,
+            {
+                let digits = seq
+                    .next_element()?
+                    .ok_or_else(|| de::Error::invalid_length(0, &self))?;
+                let exponent = seq
+                    .next_element()?
+                    .ok_or_else(|| de::Error::invalid_length(1, &self))?;
+                let bits = seq
+                    .next_element()?
+                    .ok_or_else(|| de::Error::invalid_length(2, &self))?;
+                let lsu: &[u8] = seq
+                    .next_element()?
+                    .ok_or_else(|| de::Error::invalid_length(3, &self))?;
+
+                let lsu = unsafe { std::mem::transmute::<&[u8], &[u16]>(lsu) };
+                Ok(Decimal::<N> {
+                    digits,
+                    exponent,
+                    bits,
+                    lsu: match lsu.try_into() {
+                        Ok(lsu) => lsu,
+                        Err(_) => {
+                            return Err(de::Error::invalid_value(
+                                de::Unexpected::Other("&[16] of wrong length"),
+                                &"&[16] of correct length",
+                            ))
+                        }
+                    },
+                })
+            }
+
+            fn visit_map<V>(self, mut map: V) -> Result<Decimal<N>, V::Error>
+            where
+                V: MapAccess<'de>,
+            {
+                let mut digits = None;
+                let mut exponent = None;
+                let mut bits = None;
+                let mut lsu = None;
+                while let Some(key) = map.next_key()? {
+                    match key {
+                        Field::Digits => {
+                            if digits.is_some() {
+                                return Err(de::Error::duplicate_field("digits"));
+                            }
+                            digits = Some(map.next_value()?);
+                        }
+                        Field::Exponent => {
+                            if exponent.is_some() {
+                                return Err(de::Error::duplicate_field("exponent"));
+                            }
+                            exponent = Some(map.next_value()?);
+                        }
+                        Field::Bits => {
+                            if bits.is_some() {
+                                return Err(de::Error::duplicate_field("exponent"));
+                            }
+                            bits = Some(map.next_value()?);
+                        }
+                        Field::Lsu => {
+                            if exponent.is_some() {
+                                return Err(de::Error::duplicate_field("exponent"));
+                            }
+                            lsu = Some(map.next_value()?);
+                        }
+                    }
+                }
+                let digits = digits.ok_or_else(|| de::Error::missing_field("digits"))?;
+                let exponent = exponent.ok_or_else(|| de::Error::missing_field("exponent"))?;
+                let bits = bits.ok_or_else(|| de::Error::missing_field("bits"))?;
+                let lsu: &[u8] = lsu.ok_or_else(|| de::Error::missing_field("lsu"))?;
+
+                let lsu = unsafe { std::mem::transmute::<&[u8], &[u16]>(lsu) };
+
+                Ok(Decimal::<N> {
+                    digits,
+                    exponent,
+                    bits,
+                    lsu: match lsu.try_into() {
+                        Ok(lsu) => lsu,
+                        Err(_) => {
+                            return Err(de::Error::invalid_value(
+                                de::Unexpected::Other("&[16] of wrong length"),
+                                &"&[16] of correct length",
+                            ))
+                        }
+                    },
+                })
+            }
+        }
+
+        const FIELDS: &'static [&'static str] = &["digits", "exponent", "bits", "lsu"];
+        deserializer.deserialize_struct("Decimal", FIELDS, DecimalVisitor)
     }
 }
 
@@ -417,6 +867,8 @@ impl<const N: usize> Context<Decimal<N>> {
 
     /// Adds `lhs` and `rhs`, storing the result in `lhs`.
     pub fn add(&mut self, lhs: &mut Decimal<N>, rhs: &Decimal<N>) {
+        // println!("max exp {}", self.max_exponent());
+        // println!("min exp {}", self.min_exponent());
         unsafe {
             decnumber_sys::decNumberAdd(
                 lhs.as_mut_ptr(),
@@ -425,6 +877,7 @@ impl<const N: usize> Context<Decimal<N>> {
                 &mut self.inner,
             );
         }
+        // println!("lhs digits {}", lhs.digits());
     }
 
     /// Carries out the digitwise logical and of `lhs` and `rhs`, storing
@@ -685,6 +1138,18 @@ impl<const N: usize> Context<Decimal<N>> {
         }
     }
 
+    /// Takes product of elements in `iter`.
+    pub fn product<'a, I>(&mut self, iter: I) -> Decimal<N>
+    where
+        I: Iterator<Item = &'a Decimal<N>>,
+    {
+        let mut product = Decimal::<N>::from(1);
+        for d in iter {
+            self.mul(&mut product, &d);
+        }
+        product
+    }
+
     /// Rounds or pads `lhs` so that it has the same exponent as `rhs`, storing
     /// the result in `lhs`.
     pub fn quantize(&mut self, lhs: &mut Decimal<N>, rhs: &Decimal<N>) {
@@ -723,6 +1188,18 @@ impl<const N: usize> Context<Decimal<N>> {
     pub fn rem_near(&mut self, lhs: &mut Decimal<N>, rhs: &Decimal<N>) {
         unsafe {
             decnumber_sys::decNumberRemainderNear(
+                lhs.as_mut_ptr(),
+                lhs.as_ptr(),
+                rhs.as_ptr(),
+                &mut self.inner,
+            );
+        }
+    }
+
+    /// Rescales `n` to have an exponent of `exp`.
+    pub fn rescale(&mut self, lhs: &mut Decimal<N>, rhs: &Decimal<N>) {
+        unsafe {
+            decnumber_sys::decNumberRescale(
                 lhs.as_mut_ptr(),
                 lhs.as_ptr(),
                 rhs.as_ptr(),
@@ -793,6 +1270,18 @@ impl<const N: usize> Context<Decimal<N>> {
         }
     }
 
+    /// Sums all elements of `iter`.
+    pub fn sum<'a, I>(&mut self, iter: I) -> Decimal<N>
+    where
+        I: Iterator<Item = &'a Decimal<N>>,
+    {
+        let mut sum = Decimal::<N>::zero();
+        for d in iter {
+            self.add(&mut sum, d);
+        }
+        sum
+    }
+
     /// Determines the ordering of `lhs` relative to `rhs`, using the
     /// total order predicate defined in IEEE 754-2008.
     ///
@@ -819,6 +1308,94 @@ impl<const N: usize> Context<Decimal<N>> {
         }
     }
 
+    /// Returns `m` cast as a `Decimal::<N>`.
+    pub fn to_width<const M: usize>(&mut self, mut m: Decimal<M>) -> Decimal<N> {
+        println!(
+            "\nm {}\ngoing from {} digits to {}",
+            m,
+            m.digits(),
+            N * decnumber_sys::DECDPUN
+        );
+
+        println!("m.precision() {}", m.precision());
+        println!("self.precision() {}", self.precision());
+        println!("self.max_exponent() {}", self.max_exponent());
+        println!("self.min_exponent() {}", self.min_exponent());
+        println!("m.exponent {}", m.exponent());
+        println!(
+            "usize::try_from(self.min_exponent().abs()).unwrap(){}",
+            usize::try_from(self.min_exponent().abs()).unwrap()
+        );
+        let mut cx_m = Context::<Decimal<M>>::default();
+        let m_precision = m.precision();
+
+        if m.exponent() >= 0 && m_precision as i64 > self.max_exponent() as i64 {
+            // If `m`'s precision exceeds `self`'s max exponent + 1 (i.e. its
+            // max precision), treat as overflow and return a version of infinity.
+            let mut inexact_overflow_rounded = Status::default();
+            inexact_overflow_rounded.set_inexact();
+            inexact_overflow_rounded.set_overflow();
+            inexact_overflow_rounded.set_rounded();
+            self.add_status(inexact_overflow_rounded);
+
+            // Overflows generate a literal infinity.
+            let mut r = Decimal::<N>::infinity();
+            if m.is_negative() {
+                r.set_negative();
+            }
+            return r;
+        } else if m.exponent() < 0
+            && m_precision > usize::try_from(self.min_exponent().abs()).unwrap()
+        {
+            cx_m.rescale(&mut m, &Decimal::<M>::from(self.min_exponent() as i32));
+            //  If the result is also inexact, an underflow results. The
+            //  exponent of the smallest possible number (closest to zero) will
+            //  be emin–digits+1. http://speleotrove.com/decimal/dncont.html
+            if cx_m.status().inexact() {
+                let mut inexact_rounded_subnormal_underflow = Status::default();
+                inexact_rounded_subnormal_underflow.set_inexact();
+                inexact_rounded_subnormal_underflow.set_rounded();
+                inexact_rounded_subnormal_underflow.set_subnormal();
+                inexact_rounded_subnormal_underflow.set_underflow();
+                self.add_status(inexact_rounded_subnormal_underflow);
+            }
+        }
+
+        println!("m.digits() {}", m.digits());
+        println!("self.precision() {}", self.precision());
+        // If going to too-few digits, rescale to an equivalent number that fits
+        if m.digits() as u64 > self.precision() as u64 {
+            println!("rescaling");
+            let precision_diff =
+                i32::try_from(m.digits() as u64 - self.precision() as u64).unwrap();
+            let mut cx_m = Context::<Decimal<M>>::default();
+            let f = Decimal::<M>::from(m.exponent() + precision_diff);
+            // Rescale adjusts digits and exponent.
+            cx_m.rescale(&mut m, &f);
+
+            // Set appropriate status.
+            let mut inexact_rounded_status = Status::default();
+            inexact_rounded_status.set_inexact();
+            inexact_rounded_status.set_rounded();
+            self.add_status(inexact_rounded_status);
+        };
+
+        println!("m going into n {}", m);
+
+        let mut n = Decimal::<N>::default();
+
+        let lsu_min = std::cmp::min(n.lsu.len(), m.lsu.len());
+
+        n.lsu[..lsu_min].copy_from_slice(&m.lsu[..lsu_min]);
+        n.bits = m.bits;
+        // These are guaranteed to fit due to the potential rescaling done
+        // above.
+        n.digits = m.digits;
+        n.exponent = m.exponent;
+
+        n
+    }
+
     /// Carries out the digitwise logical xor of `lhs` and `rhs`, storing
     /// the result in `lhs`.
     pub fn xor(&mut self, lhs: &mut Decimal<N>, rhs: &Decimal<N>) {
@@ -830,5 +1407,61 @@ impl<const N: usize> Context<Decimal<N>> {
                 &mut self.inner,
             );
         }
+    }
+
+    /// Constructs a number from an `i128`.
+    ///
+    /// Note that this function can return inexact results for numbers with more
+    /// than `N` * 3 places of precision, e.g. where `N` is 12,
+    /// `9_999_999_999_999_999_999_999_999_999_999_999_999i128`,
+    /// `-9_999_999_999_999_999_999_999_999_999_999_999_999i128`, `i128::MAX`,
+    /// `i128::MIN`, etc.
+    ///
+    /// However, some numbers more than `N` * 3 places of precision retain their
+    /// exactness, e.g. `1_000_000_000_000_000_000_000_000_000_000_000_000i128`.
+    ///
+    /// ```
+    /// const N: usize = 12;
+    /// use dec::Decimal::<N>;
+    /// let mut ctx = dec::Context::<Decimal::<N>>::default();
+    /// let d = ctx.from_i128(-9_999_999_999_999_999_999_999_999_999_999_999_999i128);
+    /// // Inexact result
+    /// assert!(ctx.status().inexact());
+    ///
+    /// let mut ctx = dec::Context::<Decimal::<N>>::default();
+    /// let d = ctx.from_i128(1_000_000_000_000_000_000_000_000_000_000_000_000i128);
+    /// // Exact result
+    /// assert!(!ctx.status().inexact());
+    /// ```
+    ///
+    /// To avoid inexact results when converting from large `i64`, use
+    /// [`crate::Decimal128`] instead.
+    pub fn from_i128(&mut self, n: i128) -> Decimal<N> {
+        decnum_from_signed_int!(Decimal<N>, self, n)
+    }
+
+    /// Constructs a number from an `u128`.
+    ///
+    /// Note that this function can return inexact results for numbers with 35
+    /// or more places of precision, e.g.,
+    /// `10_000_000_000_000_000_000_000_000_000_000_001u128` and `u128::MAX`.
+    ///
+    /// However, some numbers with 15 or more places of precision retain their
+    /// exactness, e.g. `10_000_000_000_000_000_000_000_000_000_000_000u128`.
+    ///
+    /// ```
+    /// use dec::Decimal128;
+    /// let mut ctx = dec::Context::<Decimal128>::default();
+    /// let d = ctx.from_i128(10_000_000_000_000_000_000_000_000_000_000_001i128);
+    /// // Inexact result
+    /// assert!(ctx.status().inexact());
+    ///
+    /// let mut ctx = dec::Context::<Decimal128>::default();
+    /// let d = ctx.from_i128(10_000_000_000_000_000_000_000_000_000_000_000i128);
+    /// // Exact result
+    /// assert!(!ctx.status().inexact());
+    /// ```
+    pub fn from_u128(&mut self, n: u128) -> Decimal<N> {
+        decnum_from_unsigned_int!(Decimal<N>, self, n)
     }
 }

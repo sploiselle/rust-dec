@@ -14,6 +14,7 @@
 // limitations under the License.
 
 use std::cmp::Ordering;
+use std::convert::TryFrom;
 use std::error::Error;
 use std::fmt;
 use std::hash::{Hash, Hasher};
@@ -23,6 +24,7 @@ use std::ops::{
 };
 
 use dec::{Context, Decimal128, Decimal32, Decimal64, OrderedDecimal, Status};
+use itertools::Itertools;
 
 #[derive(Default)]
 struct ValidatingHasher {
@@ -202,6 +204,152 @@ fn test_overloading() -> Result<(), Box<dyn Error>> {
     inner::<Decimal64, OrderedDecimal<Decimal64>>()?;
     inner::<Decimal128, OrderedDecimal<Decimal128>>()?;
 
+    Ok(())
+}
+
+#[test]
+fn test_i64_to_decnum() -> Result<(), Box<dyn Error>> {
+    use dec::Decimal;
+    const N: usize = 12;
+    fn inner(i: i64) {
+        assert_eq!(Decimal::<N>::from(i).to_string(), i.to_string());
+    }
+
+    inner(0);
+    inner(1i64);
+    inner(-1i64);
+    inner(i64::MAX);
+    inner(i64::MIN);
+    inner(i64::MAX / 2);
+    inner(i64::MIN / 2);
+
+    Ok(())
+}
+
+#[test]
+fn test_u64_to_decnum() -> Result<(), Box<dyn Error>> {
+    use dec::Decimal;
+    const N: usize = 12;
+    fn inner(i: u64) {
+        assert_eq!(Decimal::<N>::from(i).to_string(), i.to_string());
+    }
+
+    inner(0);
+    inner(1u64);
+    inner(u64::MAX);
+    inner(u64::MIN);
+    inner(u64::MAX / 2);
+    inner(u64::MIN / 2);
+
+    Ok(())
+}
+
+#[test]
+fn test_i128_to_decnum() -> Result<(), Box<dyn Error>> {
+    use dec::Decimal;
+    const N: usize = 12;
+    fn inner(input: i128, output: &str, inexact: bool) {
+        let mut cx = Context::<Decimal<N>>::default();
+        let d = cx.from_i128(input).to_string();
+        assert_eq!(d.to_string(), output);
+        assert_eq!(cx.status().inexact(), inexact);
+    }
+
+    inner(1i128, "1", false);
+    inner(-1i128, "-1", false);
+    inner(i128::from(i64::MAX), "9223372036854775807", false);
+    inner(i128::from(i64::MIN), "-9223372036854775808", false);
+    inner(i128::MAX, "1.70141183460469231731687303715884105E+38", true);
+    inner(
+        i128::MIN,
+        "-1.70141183460469231731687303715884106E+38",
+        true,
+    );
+    // +34 places is exact.
+    inner(
+        i128::MAX / 100000,
+        "1701411834604692317316873037158841",
+        false,
+    );
+    inner(
+        9_999_999_999_999_999_999_999_999_999_999_999i128,
+        "9999999999999999999999999999999999",
+        false,
+    );
+    // +36 places places can be inexact.
+    inner(
+        i128::MAX / 100,
+        "1.70141183460469231731687303715884106E+36",
+        true,
+    );
+    // +36 places can be exact.
+    inner(
+        1_000_000_000_000_000_000_000_000_000_000_000_000i128,
+        "1.00000000000000000000000000000000000E+36",
+        false,
+    );
+    // -34 places is exact.
+    inner(
+        i128::MIN / 100000,
+        "-1701411834604692317316873037158841",
+        false,
+    );
+    inner(
+        -9_999_999_999_999_999_999_999_999_999_999_999i128,
+        "-9999999999999999999999999999999999",
+        false,
+    );
+    // -36 places can be inexact.
+    inner(
+        i128::MIN / 100,
+        "-1.70141183460469231731687303715884106E+36",
+        true,
+    );
+    // -36 places can be exact.
+    inner(
+        -1_000_000_000_000_000_000_000_000_000_000_000_000i128,
+        "-1.00000000000000000000000000000000000E+36",
+        false,
+    );
+    Ok(())
+}
+
+#[test]
+fn test_u128_to_decnum() -> Result<(), Box<dyn Error>> {
+    use dec::Decimal;
+    const N: usize = 12;
+    fn inner(input: u128, output: &str, inexact: bool) {
+        let mut cx = Context::<Decimal<N>>::default();
+        let d = cx.from_u128(input).to_string();
+        assert_eq!(d.to_string(), output);
+        assert_eq!(cx.status().inexact(), inexact);
+    }
+    inner(1u128, "1", false);
+    inner(u128::MAX, "3.40282366920938463463374607431768211E+38", true);
+    inner(u128::MIN, "0", false);
+    // 34 places is exact.
+    inner(
+        u128::MAX / 100000,
+        "3402823669209384634633746074317682",
+        false,
+    );
+    inner(
+        9_999_999_999_999_999_999_999_999_999_999_999u128,
+        "9999999999999999999999999999999999",
+        false,
+    );
+    // 36 places can be exact.
+    inner(
+        1_000_000_000_000_000_000_000_000_000_000_000_000u128,
+        "1.00000000000000000000000000000000000E+36",
+        false,
+    );
+    // 36 places can be inexact.
+    inner(
+        1_000_000_000_000_000_000_000_000_000_000_000_001u128,
+        "1.00000000000000000000000000000000000E+36",
+        true,
+    );
     Ok(())
 }
 
@@ -832,6 +980,119 @@ fn test_standard_notation_dec_128() {
 }
 
 #[test]
+fn test_standard_notation_decnum() {
+    use dec::Decimal;
+    const N: usize = 12;
+    // Test output on summed numbers
+    fn sum_inner(l: &str, r: &str) {
+        let mut cx = Context::<Decimal<N>>::default();
+        let l = cx.parse(l).unwrap();
+        let r = cx.parse(r).unwrap();
+        let s = l + r;
+        assert_eq!(s.to_string(), s.to_standard_notation_string());
+    }
+    sum_inner("1.23", "2.34");
+    sum_inner(".123", ".234");
+    sum_inner("1.23", ".234");
+    sum_inner("1.23", "234");
+    sum_inner("1.23", ".77");
+    sum_inner("10", "2");
+    sum_inner("-1.23", "1.23");
+
+    // Test output on a div that maxes out precision
+    let mut cx = Context::<Decimal<N>>::default();
+    let mut d = cx.parse("1.21035").unwrap();
+    let mut r = Decimal::<N>::from(1);
+    cx.div(&mut r, &d);
+
+    assert_eq!(
+        "0.826207295410418473995125376957078531",
+        r.to_standard_notation_string()
+    );
+
+    // fn inner(d: i128, tests: &[(i32, &str, &str)]) {
+    //     let mut cx = Context::<Decimal<N>>::default();
+    //     let mut d = cx.from_i128(d);
+
+    //     for t in tests {
+    //         cx.set_exponent(&mut d, t.0);
+    //         assert_eq!(t.1, d.to_string());
+    //         assert_eq!(t.2, d.to_standard_notation_string());
+    //     }
+    // }
+
+    // // Test rescaling numbers
+    // // - Some large number
+    // inner(
+    //     -123456789012345678901234567890123456789,
+    //     &[
+    //         (
+    //             5,
+    //             "-1.234567890123456789012345678901234E+38",
+    //             "-123456789012345678901234567890123400000",
+    //         ),
+    //         (
+    //             10,
+    //             "-1.234567890123456789012345678901234E+43",
+    //             "-12345678901234567890123456789012340000000000",
+    //         ),
+    //         (
+    //             -17,
+    //             "-12345678901234567.89012345678901234",
+    //             "-12345678901234567.89012345678901234",
+    //         ),
+    //         (
+    //             -43,
+    //             "-1.234567890123456789012345678901234E-10",
+    //             "-0.0000000001234567890123456789012345678901234",
+    //         ),
+    //     ],
+    // );
+
+    // // - Zero
+    // inner(
+    //     0,
+    //     &[
+    //         (0, "0", "0"),
+    //         (10, "0E+10", "0"),
+    //         (
+    //             -43,
+    //             "0E-43",
+    //             "0.0000000000000000000000000000000000000000000",
+    //         ),
+    //     ],
+    // );
+
+    // // - Intrinsic trailing zeroes
+    // inner(
+    //     -100000000000000000000000000000000000000,
+    //     &[
+    //         (
+    //             5,
+    //             "-1.000000000000000000000000000000000E+38",
+    //             "-100000000000000000000000000000000000000",
+    //         ),
+    //         (
+    //             10,
+    //             "-1.000000000000000000000000000000000E+43",
+    //             "-10000000000000000000000000000000000000000000",
+    //         ),
+    //         (
+    //             -17,
+    //             "-10000000000000000.00000000000000000",
+    //             "-10000000000000000.00000000000000000",
+    //         ),
+    //         (
+    //             -43,
+    //             "-1.000000000000000000000000000000000E-10",
+    //             "-0.0000000001000000000000000000000000000000000",
+    //         ),
+    //     ],
+    // );
+    // panic!();
+}
+
+#[test]
 fn test_decimal64_rescale() -> Result<(), Box<dyn Error>> {
     let mut inexact_error = Status::default();
     inexact_error.set_inexact();
@@ -958,4 +1219,590 @@ fn test_decimal128_rescale() -> Result<(), Box<dyn Error>> {
     assert!(cx.status() == invalid_op_error);
 
     Ok(())
+}
+
+#[test]
+#[cfg(feature = "arbitrary-precision")]
+fn test_rescale_decnum() {
+    use dec::Decimal;
+    const N: usize = 12;
+
+    let mut inexact_error = Status::default();
+    inexact_error.set_inexact();
+    inexact_error.set_rounded();
+    let mut invalid_op_error = Status::default();
+    invalid_op_error.set_invalid_operation();
+
+    let new_cx = || Context::<dec::Decimal<N>>::default();
+    let mut cx = new_cx();
+    let mut d_original = Decimal::<N>::from(22);
+    cx.div(&mut d_original, &Decimal::<N>::from(7));
+    cx.scaleb(&mut d_original, &Decimal::<N>::from(7));
+
+    assert_eq!(d_original.exponent(), -28);
+    assert_eq!(
+        d_original.to_string(),
+        "31428571.4285714285714285714285714286"
+    );
+
+    // 5 digits of scale
+    let mut d = d_original;
+    cx.rescale(&mut d, &Decimal::<N>::from(-5));
+    assert_eq!(d.exponent(), -5);
+    assert_eq!(d.to_string(), "31428571.42857");
+    assert!(cx.status() == inexact_error);
+
+    // 0 digits of scale
+    let mut d = d_original;
+    let mut cx = new_cx();
+    cx.rescale(&mut d, &Decimal::<N>::from(0));
+    assert_eq!(d.exponent(), 0);
+    assert_eq!(d.to_string(), "31428571");
+    assert!(cx.status() == inexact_error);
+
+    // E+5
+    let mut d = d_original;
+    let mut cx = new_cx();
+    cx.rescale(&mut d, &Decimal::<N>::from(5));
+    assert_eq!(d.exponent(), 5);
+    assert_eq!(d.to_string(), "3.14E+7");
+    assert!(cx.status() == inexact_error);
+
+    // Invent zeroes when going from higher to lower scales
+    let mut d = d_original;
+    let mut cx = new_cx();
+    cx.rescale(&mut d, &Decimal::<N>::from(5));
+    cx.rescale(&mut d, &Decimal::<N>::from(-5));
+    assert_eq!(d.exponent(), -5);
+    assert_eq!(d.to_string(), "31400000.00000");
+    assert!(cx.status() == inexact_error);
+
+    // Rounds to zero
+    let mut d = d_original;
+    let mut cx = new_cx();
+    cx.rescale(&mut d, &Decimal::<N>::from(9999));
+    assert_eq!(d.exponent(), 9999);
+    assert_eq!(d.to_string(), "0E+9999");
+    assert!(cx.status() == inexact_error);
+
+    // Generates NaN
+    let mut d = d_original;
+    let mut cx = new_cx();
+    cx.rescale(&mut d, &Decimal::<N>::from(-9999));
+    assert_eq!(d.exponent(), 0);
+    assert_eq!(d.to_string(), "NaN");
+    assert!(cx.status() == invalid_op_error);
+}
+
+// /// Size | Digits | CX_{min exp} | LHS in | LHS out | RHS in | RHS out| Sum
+// /// -----|--------|--------------|--------|---------|--------|--------|-----
+// /// 12   | 36     | -1           | 9e-35  | 9e-35   | 9e-36  | 9e-35  |
+// ///
+// #[test]
+// #[cfg(feature = "arbitrary-precision")]
+// fn test_subnormal_value() {
+//     const N: usize = 12;
+//     let mut emins = vec![0, -1, -2];
+//     let mut lhs_in = vec!["9e-1", "9e-34", "9e-35", "9e-36", "9e-37"];
+//     let mut rhs_in = vec!["9e-1", "9e-34", "9e-35", "9e-36", "9e-37"];
+
+//     for emin in emins {
+//         for lhs in &lhs_in {
+//             for rhs in &rhs_in {
+//                 let mut cx = Context::<dec::Decimal<N>>::default();
+//                 cx.set_min_exponent(emin).unwrap();
+//                 let mut lhs_out = cx.parse(*lhs).unwrap();
+//                 let mut lhs_statuses = vec![];
+//                 if cx.status().inexact() {
+//                     lhs_statuses.push("i");
+//                 }
+//                 if cx.status().subnormal() {
+//                     lhs_statuses.push("s");
+//                 }
+//                 if cx.status().underflow() {
+//                     lhs_statuses.push("u");
+//                 }
+//                 cx.clear_status();
+//                 let mut rhs_out = cx.parse(*rhs).unwrap();
+//                 let mut rhs_statuses = vec![];
+//                 if cx.status().inexact() {
+//                     rhs_statuses.push("i");
+//                 }
+//                 if cx.status().subnormal() {
+//                     rhs_statuses.push("s");
+//                 }
+//                 if cx.status().underflow() {
+//                     rhs_statuses.push("u");
+//                 }
+//                 cx.clear_status();
+//                 print!(
+//                     "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t",
+//                     36,
+//                     emin,
+//                     lhs,
+//                     lhs_out,
+//                     lhs_statuses.join(","),
+//                     rhs,
+//                     rhs_out,
+//                     rhs_statuses.join(","),
+//                 );
+
+//                 cx.add(&mut lhs_out, &rhs_out);
+
+//                 let mut cx_statuses = vec![];
+//                 if cx.status().inexact() {
+//                     cx_statuses.push("i");
+//                 }
+//                 if cx.status().subnormal() {
+//                     cx_statuses.push("s");
+//                 }
+//                 if cx.status().underflow() {
+//                     cx_statuses.push("u");
+//                 }
+
+//                 println!("{}\t{}", lhs_out, cx_statuses.join(","));
+//             }
+//         }
+//     }
+//     panic!();
+//     // println!("lhs {}", lhs);
+//     // println!("lhs status {:?}", cx.status());
+//     // cx.clear_status();
+//     // let rhs = cx.parse("9E-37").unwrap();
+//     // println!("rhs {}", rhs);
+//     // println!("rhs status {:?}", cx.status());
+//     // cx.clear_status();
+//     // cx.add(&mut lhs, &rhs);
+//     // println!("sum {}", lhs);
+//     // println!("sum status {:?}", cx.status());
+// }
+
+/// Size | Digits | CX_{min exp} | LHS in | LHS out | RHS in | RHS out| Sum
+/// -----|--------|--------------|--------|---------|--------|--------|-----
+/// 12   | 36     | -1           | 9e-35  | 9e-35   | 9e-36  | 9e-35  |
+///
+// #[test]
+// #[cfg(feature = "arbitrary-precision")]
+// fn test_overflow_values() {
+//     const N: usize = 12;
+//     // let mut emaxes = vec![0, -1, -2, 35];
+//     let mut emaxes = vec![1, 2, 35];
+//     // let mut precisions = vec![1, 2, 34, 35];
+//     let mut lhs_in = vec![
+//         "9",
+//         "99",
+//         "99999999999999999999999999999999999",
+//         "9e35",
+//         "9e36",
+//         "9e37",
+//     ];
+//     let mut rhs_in = vec!["9e1", "9e34", "9e35", "9e36", "9e37"];
+
+//     for emax in emaxes {
+//         for lhs in &lhs_in {
+//             for rhs in &rhs_in {
+//                 let mut cx = Context::<dec::Decimal<N>>::default();
+//                 cx.set_max_exponent(emax).unwrap();
+//                 let mut lhs_out = cx.parse(*lhs).unwrap();
+//                 let mut lhs_statuses = vec![];
+//                 if cx.status().inexact() {
+//                     lhs_statuses.push("i");
+//                 }
+//                 if cx.status().subnormal() {
+//                     lhs_statuses.push("s");
+//                 }
+//                 if cx.status().underflow() {
+//                     lhs_statuses.push("u");
+//                 }
+//                 if cx.status().overflow() {
+//                     lhs_statuses.push("o");
+//                 }
+//                 if cx.status().rounded() {
+//                     lhs_statuses.push("r");
+//                 }
+//                 cx.clear_status();
+//                 let mut rhs_out = cx.parse(*rhs).unwrap();
+//                 let mut rhs_statuses = vec![];
+//                 if cx.status().inexact() {
+//                     rhs_statuses.push("i");
+//                 }
+//                 if cx.status().subnormal() {
+//                     rhs_statuses.push("s");
+//                 }
+//                 if cx.status().underflow() {
+//                     rhs_statuses.push("u");
+//                 }
+//                 if cx.status().overflow() {
+//                     rhs_statuses.push("o");
+//                 }
+//                 if cx.status().rounded() {
+//                     rhs_statuses.push("r");
+//                 }
+//                 cx.clear_status();
+//                 print!(
+//                     "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t",
+//                     36,
+//                     emax,
+//                     lhs,
+//                     lhs_out,
+//                     lhs_statuses.join(","),
+//                     rhs,
+//                     rhs_out,
+//                     rhs_statuses.join(","),
+//                 );
+
+//                 cx.add(&mut lhs_out, &rhs_out);
+
+//                 let mut cx_statuses = vec![];
+//                 if cx.status().inexact() {
+//                     cx_statuses.push("i");
+//                 }
+//                 if cx.status().subnormal() {
+//                     cx_statuses.push("s");
+//                 }
+//                 if cx.status().underflow() {
+//                     cx_statuses.push("u");
+//                 }
+//                 if cx.status().overflow() {
+//                     cx_statuses.push("o");
+//                 }
+//                 if cx.status().rounded() {
+//                     cx_statuses.push("r");
+//                 }
+//                 cx.clear_status();
+
+//                 println!("{}\t{}", lhs_out, cx_statuses.join(","));
+//             }
+//         }
+//     }
+//     panic!();
+//     // println!("lhs {}", lhs);
+//     // println!("lhs status {:?}", cx.status());
+//     // cx.clear_status();
+//     // let rhs = cx.parse("9E-37").unwrap();
+//     // println!("rhs {}", rhs);
+//     // println!("rhs status {:?}", cx.status());
+//     // cx.clear_status();
+//     // cx.add(&mut lhs, &rhs);
+//     // println!("sum {}", lhs);
+//     // println!("sum status {:?}", cx.status());
+// }
+
+#[test]
+#[cfg(feature = "arbitrary-precision")]
+fn test_precision_decnum() {
+    const N: usize = 12;
+    fn inner(v: &str, p: usize) {
+        let mut cx_n = Context::<dec::Decimal<N>>::default();
+        let v_n = cx_n.parse(v).unwrap();
+        assert_eq!(v_n.precision(), p);
+    }
+    inner("1", 1);
+    inner("10", 2);
+    inner("1e2", 3);
+    inner("1e-2", 2);
+    inner("1.2", 2);
+    inner("1.2e-2", 3);
+    inner("1e40", 41);
+    inner("1e-40", 40);
+    inner("0", 1);
+    // The leading zero gets folded into the exponent, i.e. 1E-1
+    inner("0.1", 1);
+    // This is still only 1 digit of precision because of its equivalence to
+    // 0E-1
+    inner("0.0", 1);
+    inner("0.0000", 4);
+}
+
+#[test]
+#[cfg(feature = "arbitrary-precision")]
+fn test_to_width_decnum() {
+    const N: usize = 12;
+    const W: usize = N + 1;
+    fn wide_to_narrow(v: &str, s: &str, digits: u32, exponent: i32, precision: usize) {
+        let mut cx_n = Context::<dec::Decimal<N>>::default();
+        let mut cx_w = Context::<dec::Decimal<W>>::default();
+        let v_w = cx_w.parse(v).unwrap();
+        let v_n = cx_n.to_width(v_w);
+        assert_eq!(v_n.to_string(), s);
+        assert_eq!(v_n.digits(), digits);
+        assert_eq!(v_n.exponent(), exponent);
+        assert_eq!(v_n.precision(), precision);
+    }
+    // Coefficient fits, exp fits
+    wide_to_narrow("1.23E+10", "1.23E+10", 3, 8, 11);
+    wide_to_narrow("1.23E-10", "1.23E-10", 3, -12, 12);
+    // Coefficient fits, exp "exceeds" precision, which has no effect
+    wide_to_narrow("1.23E+40", "1.23E+40", 3, 38, 41);
+    // Coefficient doesn't fit
+    wide_to_narrow(
+        "9876543210123456789012345678901234567",
+        "9.87654321012345678901234567890123457E+36",
+        36,
+        1,
+        37,
+    );
+    wide_to_narrow(
+        "9.87654321012345678901234567890123456789E-10",
+        "9.87654321012345678901234567890123457E-10",
+        36,
+        -45,
+        45,
+    );
+    wide_to_narrow("Infinity", "Infinity", 1, 0, 1);
+
+    fn narrow_to_wide(v: &str, s: &str, digits: u32, exponent: i32, precision: usize) {
+        let mut cx_n = Context::<dec::Decimal<N>>::default();
+        let mut cx_w = Context::<dec::Decimal<W>>::default();
+        let v_n = cx_n.parse(v).unwrap();
+        let v_w = cx_w.to_width(v_n);
+        assert_eq!(v_w.to_string(), s);
+        assert_eq!(v_w.digits(), digits);
+        assert_eq!(v_w.exponent(), exponent);
+        assert_eq!(v_w.precision(), precision);
+    }
+    // Coefficient fits, exp fits
+    narrow_to_wide("1.23E+10", "1.23E+10", 3, 8, 11);
+    narrow_to_wide(
+        "9.87654321012345678901234567890123457E+36",
+        "9.87654321012345678901234567890123457E+36",
+        36,
+        1,
+        37,
+    );
+    narrow_to_wide("Infinity", "Infinity", 1, 0, 1);
+
+    fn min_max_exp_wide_to_narrow(v: &str, s: &str, digits: u32, exponent: i32, precision: usize) {
+        let mut cx_n = Context::<dec::Decimal<N>>::default();
+        cx_n.set_max_exponent(N as isize * 3 - 1);
+        cx_n.set_min_exponent(-(N as isize) * 3 + 1);
+        let mut cx_w = Context::<dec::Decimal<W>>::default();
+        let v_w = cx_w.parse(v).unwrap();
+        let v_n = cx_n.to_width(v_w);
+        assert_eq!(v_n.to_string(), s);
+        assert_eq!(v_n.digits(), digits);
+        assert_eq!(v_n.exponent(), exponent);
+        assert_eq!(v_n.precision(), precision);
+        // panic!();
+    }
+    min_max_exp_wide_to_narrow(
+        "98765432101234567890123456789012345",
+        "98765432101234567890123456789012345",
+        35,
+        0,
+        35,
+    );
+    min_max_exp_wide_to_narrow("9E-10", "9E-10", 1, -10, 10);
+    // Exceeds max
+    min_max_exp_wide_to_narrow("9E37", "Infinity", 1, 0, 1);
+    // Exceeds min
+    min_max_exp_wide_to_narrow("9E-36", "1E-35", 1, -35, 35);
+    // ~= 9E-36
+    min_max_exp_wide_to_narrow(".000000000000000000000000000000000009", "1E-35", 1, -35, 35);
+    // ~= 9E-37
+    min_max_exp_wide_to_narrow(
+        ".0000000000000000000000000000000000009",
+        "0E-35",
+        1,
+        -35,
+        35,
+    );
+    min_max_exp_wide_to_narrow(
+        ".1234567890123456789012345678901234567",
+        "0.12345678901234567890123456789012346",
+        35,
+        -35,
+        35,
+    );
+}
+
+#[test]
+#[cfg(feature = "arbitrary-precision")]
+/// Aggregate a set of valid values with width `N` into width `M`, and then go
+/// back to `N`-width. This test is bespoke for Materialize's needs when
+/// aggregating values using library.
+fn test_agg_wide_narrow_decnum() {
+    const N: usize = 12;
+    const M: usize = N + 1;
+    fn inner(v: &[&str], e_m: &str, inexact_m: bool, e_n: &str, inexact_n: bool) {
+        let mut cx_n = Context::<dec::Decimal<N>>::default();
+        // 35 max exp == 36 digits max
+        cx_n.set_max_exponent(N as isize * 3 - 1);
+        let mut cx_m = Context::<dec::Decimal<M>>::default();
+        // 36 max exp == 37 digits max
+        cx_m.set_max_exponent(M as isize * 3 - 3);
+
+        // Parse values as `N`, but then convert to `M` and aggregate.
+        let s = v
+            .iter()
+            .map(|v| {
+                let v_n = cx_n.parse(*v).unwrap();
+                cx_m.to_width(v_n)
+            })
+            .collect::<Vec<_>>();
+
+        // Aggregate.
+        let sum_m = cx_m.sum(s.iter());
+
+        // Go back to `N`.
+        let sum_n = cx_n.to_width(sum_m);
+
+        assert_eq!(sum_m.to_string(), e_m);
+        assert_eq!(cx_m.status().inexact(), inexact_m);
+        assert_eq!(sum_n.to_string(), e_n);
+        assert_eq!(cx_n.status().inexact(), inexact_n);
+    }
+    // Vanilla aggregation
+    inner(
+        &["9876543210", "123456789"],
+        "9999999999",
+        false,
+        "9999999999",
+        false,
+    );
+    // Ensure intermediate value exceeds `N`.
+    inner(
+        &[
+            "987654321012345678901234567890123456",
+            "987654321012345678901234567890123456",
+        ],
+        "1975308642024691357802469135780246912",
+        false,
+        "Infinity",
+        true,
+    );
+    inner(
+        &["9e35", "9e35"],
+        "1800000000000000000000000000000000000",
+        false,
+        "Infinity",
+        true,
+    );
+    // Ensure intermediate value exceeds `N`, negative.
+    inner(
+        &[
+            "-987654321012345678901234567890123456",
+            "-987654321012345678901234567890123456",
+        ],
+        "-1975308642024691357802469135780246912",
+        false,
+        "-Infinity",
+        true,
+    );
+    // Test infinities
+    inner(
+        &["Infinity", "Infinity"],
+        "Infinity",
+        false,
+        "Infinity",
+        false,
+    );
+    inner(&["-Infinity", "Infinity"], "NaN", false, "NaN", false);
+    // Span agg width OK
+    inner(
+        &["9e35", "9e-3"],
+        "900000000000000000000000000000000000.009",
+        false,
+        "900000000000000000000000000000000000",
+        true,
+    );
+    // Exceed `M`'s width the hard way
+    inner(
+        &[
+            "9e35", "9e35", "9e35", "9e35", "9e35", "9e35", "9e35", "9e35", "9e35", "9e35", "9e35",
+            "9e35", "9e35", "9e35", "9e35", "9e35", "9e35", "9e35", "9e35", "9e35", "9e35", "9e35",
+            "9e35", "9e35", "9e35", "9e35", "9e35", "9e35", "9e35", "9e35", "9e35", "9e35", "9e35",
+            "9e35", "9e35", "9e35", "9e35", "9e35", "9e35", "9e35", "9e35", "9e35", "9e35", "9e35",
+            "9e35", "9e35", "9e35", "9e35", "9e35", "9e35", "9e35", "9e35", "9e35", "9e35", "9e35",
+            "9e35", "9e35", "9e35", "9e35", "9e35", "9e35", "9e35", "9e35", "9e35", "9e35", "9e35",
+            "9e35", "9e35", "9e35", "9e35", "9e35", "9e35", "9e35", "9e35", "9e35", "9e35", "9e35",
+            "9e35", "9e35", "9e35", "9e35", "9e35", "9e35", "9e35", "9e35", "9e35", "9e35", "9e35",
+            "9e35", "9e35", "9e35", "9e35", "9e35", "9e35", "9e35", "9e35", "9e35", "9e35", "9e35",
+            "9e35", "9e35", "9e35", "9e35", "9e35", "9e35", "9e35", "9e35", "9e35", "9e35", "9e35",
+            "9e35", "9e35", "9e35", "9e35", "9e35", "9e35", "9e35", "9e35", "9e35", "9e35", "9e35",
+            "9e35", "9e35", "9e35", "9e35",
+        ],
+        "Infinity",
+        true,
+        "Infinity",
+        // Because the wide value is infinity, the narrow value is, as well, but
+        // it isn't intrinsically aware of the aggregate's inexactitude, meaning
+        // its context does not propagate the status.
+        false,
+    );
+    // Exceed `M`'s width the easy way
+    inner(
+        &["9e35", "9e35", "9e-3"],
+        "1800000000000000000000000000000000000.01",
+        true,
+        "1.80000000000000000000000000000000000E+36",
+        true,
+    );
+}
+
+#[test]
+#[cfg(feature = "arbitrary-precision")]
+/// Aggregate a set of valid values with width `N` into width `M`, and then go
+/// back to `N`-width. This test is bespoke for Materialize's needs when
+/// aggregating values using library.
+fn test_agg_wide_narrow_decnum() {
+    const N: usize = 12;
+    const M: usize = N + 1;
+    fn inner(v: &[&str], e_m: &str, inexact_m: bool, e_n: &str, inexact_n: bool) {
+        let mut cx_n = Context::<dec::Decimal<N>>::default();
+        // 35 max exp == 36 digits max
+        cx_n.set_max_exponent(N as isize * 3 - 1);
+        let mut cx_m = Context::<dec::Decimal<M>>::default();
+        // 36 max exp == 37 digits max
+        cx_m.set_max_exponent(M as isize * 3 - 3);
+
+        // Parse values as `N`, but then convert to `M` and aggregate.
+        let s = v
+            .iter()
+            .map(|v| {
+                let v_n = cx_n.parse(*v).unwrap();
+                cx_m.to_width(v_n)
+            })
+            .collect::<Vec<_>>();
+
+        // Aggregate.
+        let sum_m = cx_m.sum(s.iter());
+
+        // Go back to `N`.
+        let sum_n = cx_n.to_width(sum_m);
+
+        assert_eq!(sum_m.to_string(), e_m);
+        assert_eq!(cx_m.status().inexact(), inexact_m);
+        assert_eq!(sum_n.to_string(), e_n);
+        assert_eq!(cx_n.status().inexact(), inexact_n);
+    }
+}
+
+#[test]
+#[cfg(feature = "arbitrary-precision")]
+/// Aggregate a set of valid values with width `N` into width `M`, and then go
+/// back to `N`-width. This test is bespoke for Materialize's needs when
+/// aggregating values using library.
+fn test_scale_decnum() {
+    const N: usize = 12;
+    fn inner(v: &str) {
+        let mut cx_n = Context::<dec::Decimal<N>>::default();
+        cx_n.set_min_exponent(-isize::try_from(cx_n.precision()).unwrap() + 2);
+        let mut v_n = cx_n.parse(v).unwrap();
+        cx_n.rescale(&mut v_n, &dec::Decimal::<N>::from(-2));
+        println!("{}, {}", v, v_n.to_string());
+        // assert_eq!(v_n.precision(), p);
+    }
+    inner("1");
+    inner("1.2");
+    inner("1.23");
+    inner("1.234");
+    inner("1.2345");
+    inner("100.2345");
+    inner("1");
+    inner("1.2");
+    inner("1.23");
+    inner("1.235");
+    inner("1.2355");
+    inner("100.2355");
 }

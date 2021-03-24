@@ -16,6 +16,7 @@
 //! [libdecnumber]: http://speleotrove.com/decimal/
 
 use libc::{c_char, c_uint};
+use serde::{Deserialize, Serialize};
 
 pub type rounding = c_uint;
 pub const DEC_ROUND_CEILING: rounding = 0;
@@ -108,7 +109,7 @@ pub const DECSPECIAL: u8 = DECINF | DECNAN | DECSNAN;
 pub const DECDPUN: usize = 3;
 
 #[repr(C)]
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, Deserialize, Serialize)]
 pub struct decNumber {
     pub digits: i32,
     pub exponent: i32,
@@ -1009,7 +1010,7 @@ extern "C" {
 }
 
 #[repr(C, align(4))]
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, Deserialize, Serialize)]
 pub struct decimal32 {
     pub bytes: [u8; 4usize],
 }
@@ -1045,7 +1046,7 @@ extern "C" {
 }
 
 #[repr(C, align(4))]
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, Deserialize, Serialize)]
 pub struct decimal64 {
     pub bytes: [u8; 8usize],
 }
@@ -1069,7 +1070,7 @@ extern "C" {
 }
 
 #[repr(C, align(4))]
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, Deserialize, Serialize)]
 pub struct decimal128 {
     pub bytes: [u8; 16usize],
 }

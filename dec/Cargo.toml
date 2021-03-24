@@ -13,7 +13,9 @@ edition = "2018"
 
 [dependencies]
 decnumber-sys = { version = "0.1.5", path = "../decnumber-sys" }
+itertools = "0.10.0"
 libc = "0.2.82"
+serde = { version = "1.0.124", features = ["derive"] }
 static_assertions = { version = "1.1.0", optional = true }
 
 [dev-dependencies]

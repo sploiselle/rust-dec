@@ -21,6 +21,7 @@ use std::mem::MaybeUninit;
 use std::str::FromStr;
 
 use libc::c_char;
+use serde::{Deserialize, Serialize};
 
 use crate::context::Context;
 #[cfg(feature = "arbitrary-precision")]
@@ -29,7 +30,7 @@ use crate::decimal64::Decimal64;
 use crate::error::ParseDecimalError;
 
 /// A 32-bit decimal floating-point number.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Deserialize, Serialize)]
 pub struct Decimal32 {
     pub(crate) inner: decnumber_sys::decSingle,
 }
